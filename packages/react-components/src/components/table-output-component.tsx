@@ -197,7 +197,12 @@ export class TableOutputComponent extends AbstractOutputComponent<TableOutputPro
                     headerName: columnHeader.name,
                     field: columnHeader.id.toString(),
                     width: this.props.columnWidth,
-                    resizable: true
+                    resizable: true,
+                    filter: 'agTextColumnFilter',
+                    filterParams: {
+                        suppressAndOrCondition: true,
+                        debounceMs: 200
+                    }
                 });
             });
             }
