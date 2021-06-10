@@ -8,9 +8,12 @@ import { cloneDeep } from 'lodash';
 import { signalManager } from '@trace-viewer/base/lib/signals/signal-manager';
 import { TimelineChart } from 'timeline-chart/lib/time-graph-model';
 import { CellKeyDownEvent } from 'ag-grid-community/dist/lib/events';
+import { Line } from 'tsp-typescript-client/lib/models/table';
+import { SearchFilterRenderer, CellRenderer, LoadingRenderer } from './table-renderer-components';
 
 type TableOuputState = AbstractOutputState & {
     tableColumns: ColDef[];
+    rowData: any[];
 };
 
 type TableOutputProps = AbstractOutputProps & {
@@ -28,19 +31,20 @@ export class TableOutputComponent extends AbstractOutputComponent<TableOutputPro
     private fetchColumns = true;
     private columnArray = new Array<any>();
     private showIndexColumn = false;
-    private components: any;
+    private frameworkComponents: any;
     private gridApi: GridApi | undefined = undefined;
     private columnApi: ColumnApi | undefined = undefined;
     private prevStartTimestamp: number = Number.MIN_VALUE;
     private startTimestamp: number = Number.MAX_VALUE;
     private endTimestamp: number = Number.MIN_VALUE;
-    private isIndexChanged = false;
     private columnsPacked = false;
     private timestampCol: string | undefined = undefined;
     private eventSignal = false;
     private enableIndexSelection = true;
     private selectStartIndex = -1;
     private selectEndIndex = -1;
+    private filterModel: Map<string, string> = new Map<string, string>();
+    private dataSource: IDatasource;
 
     static defaultProps: Partial<TableOutputProps> = {
         cacheBlockSize: 200,
@@ -54,19 +58,33 @@ export class TableOutputComponent extends AbstractOutputComponent<TableOutputPro
     constructor(props: TableOutputProps) {
         super(props);
 
-        this.components = {
-            loadingRenderer: (params: any) => {
-                if (params.value !== undefined) {
-                    return params.value;
-                } else {
-                    return '<i class="fa fa-spinner fa-spin"></i>';
+        this.frameworkComponents = {
+            searchFilterRenderer: SearchFilterRenderer,
+            loadingRenderer: LoadingRenderer,
+            cellRenderer: CellRenderer
+        }
+
+        this.dataSource = {
+            getRows: async params => {
+                if (this.fetchColumns) {
+                    this.fetchColumns = false;
+                    await this.init();
                 }
+                const rowsThisPage = await this.fetchSearchTableLines(params.startRow, params.endRow - params.startRow);
+                for (let i = 0; i < rowsThisPage.length; i++) {
+                    const item = rowsThisPage[i];
+                    const itemCopy = cloneDeep(item);
+                    rowsThisPage[i] = itemCopy;
+                }
+                params.successCallback(rowsThisPage, this.props.nbEvents);
             }
         };
 
         this.onEventClick = this.onEventClick.bind(this);
         this.onModelUpdated = this.onModelUpdated.bind(this);
         this.onKeyDown = this.onKeyDown.bind(this);
+        this.searchEvents = this.searchEvents.bind(this);
+        this.findNextMatchedEvent = this.findNextMatchedEvent.bind(this);
     }
 
     renderMainArea(): React.ReactNode {
@@ -81,11 +99,11 @@ export class TableOutputComponent extends AbstractOutputComponent<TableOutputPro
                 blockLoadDebounceMillis={this.props.blockLoadDebounce}
                 debug={this.debugMode}
                 onGridReady={this.onGridReady}
-                components={this.components}
                 onCellClicked={this.onEventClick}
                 rowSelection='multiple'
                 onModelUpdated={this.onModelUpdated}
                 onCellKeyDown={this.onKeyDown}
+                frameworkComponents={this.frameworkComponents}
             >
             </AgGridReact>
         </div>;
@@ -104,7 +122,7 @@ export class TableOutputComponent extends AbstractOutputComponent<TableOutputPro
 
     async componentDidUpdate(prevProps: TableOutputProps, prevState: TableOuputState): Promise<void> {
         if (this.props.nbEvents !== prevProps.nbEvents) {
-            this.gridApi?.setInfiniteRowCount(this.props.nbEvents);
+            this.gridApi?.setRowCount(this.props.nbEvents);
         }
     }
 
@@ -114,19 +132,22 @@ export class TableOutputComponent extends AbstractOutputComponent<TableOutputPro
         const mouseEvent = event.event as MouseEvent;
         const gridApi = event.api;
         const rowIndex = event.rowIndex;
-        const itemPropsObj = this.fetchItemProperties(columns, data);
+
+        const itemPropsObj = (columns && this.fetchItemProperties(columns, data)) || undefined;
         signalManager().fireTooltipSignal(itemPropsObj);
 
         const currTimestamp = (this.timestampCol && data) ? data[this.timestampCol] : undefined;
         this.enableIndexSelection = true;
         if (mouseEvent.shiftKey) {
             if (this.selectStartIndex === -1) {
-                this.selectStartIndex = rowIndex;
+                if (rowIndex)
+                    this.selectStartIndex = rowIndex;
                 if (currTimestamp) {
                     this.startTimestamp = Number(currTimestamp);
                 }
             }
-            this.selectEndIndex = rowIndex;
+            if (rowIndex)
+                this.selectEndIndex = rowIndex;
             if (currTimestamp) {
                 this.endTimestamp = Number(currTimestamp);
             }
@@ -139,7 +160,8 @@ export class TableOutputComponent extends AbstractOutputComponent<TableOutputPro
                     rowNode.setSelected(true);
                 }
             }
-            this.selectStartIndex = this.selectEndIndex = rowIndex;
+            if (rowIndex)
+                this.selectStartIndex = this.selectEndIndex = rowIndex;
             if (currTimestamp) {
                 this.startTimestamp = this.endTimestamp = Number(currTimestamp);
             }
@@ -172,17 +194,18 @@ export class TableOutputComponent extends AbstractOutputComponent<TableOutputPro
             let isContiguous = true;
             if (keyEvent.shiftKey) {
                 if (keyEvent.code === 'ArrowDown') {
-                    if (!currentRow.isSelected()) {
+                    if (currentRow && !currentRow.isSelected()) {
                         gridApi.deselectAll();
                         isContiguous = false;
                     }
 
-                    const nextRow = gridApi.getRowNode(String(rowIndex + 1));
+                    const nextRow = rowIndex ? gridApi.getRowNode(String(rowIndex + 1)) : null;
                     if (isContiguous === false) {
-                        if (this.timestampCol && nextRow.data) {
+                        if (this.timestampCol && nextRow && nextRow.data) {
                             this.startTimestamp = this.endTimestamp = Number(nextRow.data[this.timestampCol]);
                         }
-                        this.selectStartIndex = this.selectEndIndex = nextRow.rowIndex;
+                        if (nextRow && nextRow.rowIndex)
+                            this.selectStartIndex = this.selectEndIndex = nextRow.rowIndex;
                     } else {
                         if (this.selectEndIndex < this.selectStartIndex) {
                             if (currentRow && currentRow.id) {
@@ -194,23 +217,24 @@ export class TableOutputComponent extends AbstractOutputComponent<TableOutputPro
                             }
                         }
                         this.selectEndIndex += 1;
-                        if (this.timestampCol && nextRow.data) {
+                        if (this.timestampCol && nextRow && nextRow.data) {
                             this.endTimestamp = Number(nextRow.data[this.timestampCol]);
                         }
                     }
                     this.handleRowSelectionChange();
                 } else if (keyEvent.code === 'ArrowUp') {
-                    if (!currentRow.isSelected()) {
+                    if (currentRow && !currentRow.isSelected()) {
                         gridApi.deselectAll();
                         isContiguous = false;
                     }
-                    const nextRow = gridApi.getRowNode(String(rowIndex - 1));
+                    const nextRow = rowIndex ? gridApi.getRowNode(String(rowIndex - 1)) : null;
 
                     if (isContiguous === false) {
-                        if (this.timestampCol && nextRow.data) {
+                        if (this.timestampCol && nextRow && nextRow.data) {
                             this.startTimestamp = this.endTimestamp = Number(nextRow.data[this.timestampCol]);
                         }
-                        this.selectStartIndex = this.selectEndIndex = nextRow.rowIndex;
+                        if (nextRow && nextRow.rowIndex)
+                            this.selectStartIndex = this.selectEndIndex = nextRow.rowIndex;
                     } else {
                         if (this.selectStartIndex < this.selectEndIndex) {
                             if (currentRow && currentRow.id) {
@@ -222,14 +246,15 @@ export class TableOutputComponent extends AbstractOutputComponent<TableOutputPro
                             }
                         }
                         this.selectEndIndex -= 1;
-                        if (this.timestampCol && nextRow.data) {
+                        if (this.timestampCol && nextRow && nextRow.data) {
                             this.endTimestamp = Number(nextRow.data[this.timestampCol]);
                         }
                     }
                     this.handleRowSelectionChange();
 
                 } else if (keyEvent.code === 'Space') {
-                    this.selectEndIndex = rowIndex;
+                    if (rowIndex)
+                        this.selectEndIndex = rowIndex;
                     if (currTimestamp) {
                         this.endTimestamp = Number(currTimestamp);
                     }
@@ -241,64 +266,18 @@ export class TableOutputComponent extends AbstractOutputComponent<TableOutputPro
                 if (currentRow && currentRow.id) {
                     currentRow.setSelected(true);
                 }
-                this.selectStartIndex = this.selectEndIndex = rowIndex;
+                if (rowIndex)
+                    this.selectStartIndex = this.selectEndIndex = rowIndex;
                 this.startTimestamp = this.endTimestamp = Number(currTimestamp);
                 this.handleRowSelectionChange();
             }
         }
     }
 
-    private async fetchTableLines(fetchIndex: number, linesToFetch: number) {
-        const traceUUID = this.props.traceId;
-        const tspClient = this.props.tspClient;
-        const outputId = this.props.outputDescriptor.id;
-
-        const tspClientResponse = await tspClient.fetchTableLines(traceUUID, outputId, QueryHelper.tableQuery(this.columnIds, fetchIndex, linesToFetch));
-        const lineResponse = tspClientResponse.getModel();
-        const linesArray = new Array<any>();
-        if (!tspClientResponse.isOk() || !lineResponse) {
-            return linesArray;
-        }
-        const model = lineResponse.model;
-        const lines = model.lines;
-        lines.forEach(line => {
-            const obj: any = {};
-            const cells = line.cells;
-            const ids = model.columnIds;
-
-            if (this.showIndexColumn) {
-                obj[0] = line.index.toString();
-            }
-
-            for (let i = 0; i < cells.length; i++) {
-                const id = this.showIndexColumn ? ids[i] + 1 : ids[i];
-                obj[id] = cells[i].content;
-            }
-            linesArray.push(obj);
-        });
-
-        return linesArray;
-    }
-
     private onGridReady = async (event: GridReadyEvent) => {
         this.gridApi = event.api;
         this.columnApi = event.columnApi;
-        const dataSource: IDatasource = {
-            getRows: async params => {
-                if (this.fetchColumns) {
-                    this.fetchColumns = false;
-                    await this.init();
-                }
-                const rowsThisPage = await this.fetchTableLines(params.startRow, params.endRow - params.startRow);
-                for (let i = 0; i < rowsThisPage.length; i++) {
-                    const item = rowsThisPage[i];
-                    const itemCopy = cloneDeep(item);
-                    rowsThisPage[i] = itemCopy;
-                }
-                params.successCallback(rowsThisPage, this.props.nbEvents);
-            }
-        };
-        event.api.setDatasource(dataSource);
+        event.api.setDatasource(this.dataSource);
     };
 
     private async init() {
@@ -331,13 +310,30 @@ export class TableOutputComponent extends AbstractOutputComponent<TableOutputPro
                     headerName: columnHeader.name,
                     field: columnHeader.id.toString(),
                     width: this.props.columnWidth,
-                    resizable: true
+                    resizable: true,
+                    cellRenderer: 'cellRenderer',
+                    cellRendererParams: {
+                        filterModel: this.filterModel
+                    },
+                    suppressMenu: true,
+                    filter: "agTextColumnFilter",
+                    floatingFilter: true,
+                    floatingFilterComponent: 'searchFilterRenderer',
+                    floatingFilterComponentParams: {
+                        suppressFilterButton: true,
+                        onFilterChange: this.searchEvents,
+                        onclickNext: this.findNextMatchedEvent,
+                        colName: columnHeader.id.toString()
+                    },
+                    icons: {
+                        filter: ""
+                    }
                 });
             });
         }
 
         if (!this.showIndexColumn) {
-            columnsArray[0].cellRenderer = 'loadingRenderer';
+            columnsArray[0].cellRenderer = 'cellRenderer';
         }
 
         this.columnIds = colIds;
@@ -349,7 +345,7 @@ export class TableOutputComponent extends AbstractOutputComponent<TableOutputPro
 
         if (this.columnApi) {
             const columns = this.columnApi.getAllColumns();
-            const timestampHeader = columns.find(column => column.getColDef().headerName === 'Timestamp ns');
+            const timestampHeader = columns && columns.find(column => column.getColDef().headerName === 'Timestamp ns');
             if (timestampHeader) {
                 this.timestampCol = timestampHeader.getColDef().field;
             }
@@ -388,9 +384,9 @@ export class TableOutputComponent extends AbstractOutputComponent<TableOutputPro
                 this.selectStartIndex = this.selectEndIndex = -1;
                 this.gridApi.deselectAll();
 
-                const index = await this.fetchTableIndex(this.startTimestamp > this.endTimestamp ? this.startTimestamp+1 : this.startTimestamp);
+                const index = await this.fetchTableIndex(this.startTimestamp > this.endTimestamp ? this.startTimestamp + 1 : this.startTimestamp);
                 if (index) {
-                    const startIndex = this.startTimestamp > this.endTimestamp ? index-1 : index;
+                    const startIndex = this.startTimestamp > this.endTimestamp ? index - 1 : index;
                     this.selectStartIndex = this.selectStartIndex === -1 ? startIndex : this.selectStartIndex;
                     this.selectEndIndex = (this.enableIndexSelection && this.selectEndIndex === -1) ? startIndex : this.selectEndIndex;
                     this.gridApi.ensureIndexVisible(this.selectStartIndex);
@@ -420,6 +416,58 @@ export class TableOutputComponent extends AbstractOutputComponent<TableOutputPro
         return lines[0].index;
     }
 
+    private fetchAdditionalParams(isFiltered: boolean = false): ({ [key: string]: any }) {
+        let additionalParams: { [key: string]: any } = {};
+        if (this.filterModel) {
+            var filterObj: { [key: number]: string } = {};
+            this.filterModel.forEach((value: string, key: string) => {
+                const k: number = Number.parseInt(key);
+                filterObj[k] = value;
+            });
+            additionalParams = {
+                ['table_search_expressions']: filterObj,
+                ['isFiltered']: isFiltered
+            };
+        }
+        return additionalParams;
+
+    }
+
+    private async fetchSearchTableLines(fetchIndex: number, linesToFetch: number) {
+        const traceUUID = this.props.traceId;
+        const tspClient = this.props.tspClient;
+        const outputId = this.props.outputDescriptor.id;
+
+        const additionalParams = this.fetchAdditionalParams();
+        const tspClientResponse = await tspClient.fetchTableLines(traceUUID, outputId, QueryHelper.tableQuery(this.columnIds, fetchIndex, linesToFetch, additionalParams));
+        const lineResponse = tspClientResponse.getModel();
+        const linesArray = new Array<Line>();
+        if (!tspClientResponse.isOk() || !lineResponse) {
+            return linesArray;
+        }
+        const model = lineResponse.model;
+        const lines = model.lines;
+        lines.forEach(line => {
+            const obj: any = {};
+            const cells = line.cells;
+            const columnIds = model.columnIds;
+
+            if (this.showIndexColumn) {
+                obj[0] = line.index.toString();
+            }
+
+            cells.forEach((cell, index) => {
+                const id = this.showIndexColumn ? columnIds[index] + 1 : columnIds[index];
+                obj[id] = cell.content;
+            })
+
+            obj['isMatched'] = (line.tags !== undefined && line.tags > 0);
+            linesArray.push(obj);
+        });
+
+        return linesArray;
+    }
+
     private onModelUpdated = async () => {
         this.selectRows();
 
@@ -429,8 +477,67 @@ export class TableOutputComponent extends AbstractOutputComponent<TableOutputPro
         }
     };
 
+    private searchEvents(colName: string, filterValue: string) {
+        if (filterValue === '') {
+            this.filterModel.delete(colName);
+        } else {
+            this.filterModel.set(colName, filterValue);
+        }
+        this.gridApi?.setDatasource(this.dataSource);
+    }
+
+    private async findNextMatchIndex(currRowIndex: number) {
+        const traceUUID = this.props.traceId;
+        const tspClient = this.props.tspClient;
+        const outputId = this.props.outputDescriptor.id;
+        const additionalParams = this.fetchAdditionalParams(true)
+        const tspClientResponse = await tspClient.fetchTableLines(traceUUID, outputId, QueryHelper.tableQuery(this.columnIds, currRowIndex, 1, additionalParams));
+        const lineResponse = tspClientResponse.getModel();
+        if (!tspClientResponse.isOk() || !lineResponse) {
+            return undefined;
+        }
+        const model = lineResponse.model;
+        const lines = model.lines;
+        if (lines.length === 0) {
+            return undefined;
+        }
+        return lines[0].index;
+    }
+
+    private async findNextMatchedEvent() {
+        let isFound: boolean = false;
+        if (this.gridApi) {
+            this.gridApi.deselectAll();
+            this.gridApi.forEachNode(rowNode => {
+                if (rowNode && rowNode.rowIndex !== null
+                    && rowNode.rowIndex > Math.max(this.selectStartIndex, this.selectEndIndex) && rowNode.data
+                    && rowNode.data['isMatched'] && !isFound) {
+                    this.gridApi?.ensureIndexVisible(rowNode.rowIndex);
+                    this.selectStartIndex = this.selectEndIndex = rowNode.rowIndex;
+                    this.handleRowSelectionChange();
+                    rowNode.setSelected(true);
+                    isFound = true;
+                }
+            });
+
+            if (isFound) {
+                return;
+            }
+
+            const currRowIndex = this.gridApi?.getLastDisplayedRow() + 1;
+            const lineIndex = await this.findNextMatchIndex(currRowIndex);
+            if (lineIndex) {
+                this.gridApi.ensureIndexVisible(lineIndex);
+                this.selectStartIndex = this.selectEndIndex = lineIndex;
+                this.handleRowSelectionChange();
+                this.enableIndexSelection = true;
+                this.selectRows();
+            }
+        }
+    }
+
     private isValidRowSelection(rowNode: RowNode): boolean {
-        if ((this.enableIndexSelection && this.selectStartIndex !== -1 && this.selectEndIndex !== -1 && rowNode.rowIndex >= Math.min(this.selectStartIndex, this.selectEndIndex)
+        if ((this.enableIndexSelection && this.selectStartIndex !== -1 && this.selectEndIndex !== -1 && rowNode && rowNode.rowIndex && rowNode.rowIndex >= Math.min(this.selectStartIndex, this.selectEndIndex)
             && rowNode.rowIndex <= Math.max(this.selectStartIndex, this.selectEndIndex)) || (!this.enableIndexSelection
                 && this.timestampCol && rowNode.data[this.timestampCol] >= Math.min(this.startTimestamp, this.endTimestamp)
                 && rowNode.data[this.timestampCol] <= Math.max(this.startTimestamp, this.endTimestamp))) {
