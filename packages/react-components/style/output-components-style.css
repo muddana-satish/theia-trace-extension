@@ -141,3 +141,8 @@ canvas {
 .hoverClass:hover {
     border: 1px solid black;
 }
+
+.react-grid-item > .react-resizable-handle::after {
+    border-right: 2px solid var(--theia-input-placeholder-foreground) !important;
+    border-bottom: 2px solid var(--theia-input-placeholder-foreground) !important;
+}
